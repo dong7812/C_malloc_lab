@@ -393,6 +393,44 @@ void *mm_realloc(void *ptr, size_t size)
     void *newptr;
     size_t copySize;
 
+    #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
+    // 최적화 1: 현재 블록 크기 확인
+    size_t old_size = GET_SIZE(HDRP(ptr));
+    size_t asize;
+
+    // 필요한 크기 계산
+    #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
+    if (size <= DSIZE)
+        asize = 4 * DSIZE;
+    else
+        asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+    #else
+    if (size <= DSIZE)
+        asize = 2 * DSIZE;
+    else
+        asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+    #endif
+
+    // 최적화 2: 현재 블록이 충분하면 그대로 반환
+    if (old_size >= asize) {
+        return ptr;
+    }
+
+    // 최적화 3: 다음 블록이 free이면 병합 시도
+    void *next_bp = NEXT_BLKP(ptr);
+    size_t next_alloc = GET_ALLOC(HDRP(next_bp));
+    size_t next_size = GET_SIZE(HDRP(next_bp));
+
+    if (!next_alloc && (old_size + next_size) >= asize) {
+        #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
+        remove_free(next_bp);
+        #endif
+        PUT(HDRP(ptr), PACK(old_size + next_size, 1));
+        PUT(FTRP(ptr), PACK(old_size + next_size, 1));
+        return ptr;
+    }
+    #endif
+
     newptr = mm_malloc(size);
     if (newptr == NULL)
         return NULL;
