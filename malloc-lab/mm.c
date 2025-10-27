@@ -23,6 +23,10 @@
   #define USE_FIRST 1
 #elif defined(FIT_NEXT)
   #define USE_NEXT 1
+#elif defined(FIT_EXPLI)
+  #define USE_EXPLI 1
+#elif defined(FIT_EXPLI_BEST)
+  #define USE_EXPLI_BEST 1
 #else
   #define USE_FIRST 1  // default
 #endif
@@ -88,6 +92,13 @@ PACK 크기와 할당 비트를 통합하여 header와 footer에 저장할 수 �
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))     /* Given block ptr bp, compute address of next blocks */
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))     /* Given block ptr bp, compute address of previous blocks */
 
+// explicit
+// free block payload 앞부분을 포인터 필드로 사용
+#define PRED_PTR(bp) ((void **)(bp))
+#define SUCC_PTR(bp) ((void **)(bp) + 1)
+#define PRED(bp) (*((void **)(bp)))
+#define  SUCC(bp) (*((void **)(bp) + 1))
+
 typedef unsigned long dword_t;
 typedef char* byte_p;
 
@@ -99,6 +110,10 @@ static void *extend_heap(size_t words);
 static void *find_fit(size_t asize);
 static void place(void *bp, size_t asize);
 
+// explicit
+static void *free_list_head = NULL;
+static void insert_free(void *bp);
+static void remove_free(void *bp);
 /*
  * mm_init - initialize the malloc package.
  */
@@ -108,6 +123,10 @@ int mm_init(void)
     if((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1){
         return -1;
     }
+
+    #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
+    free_list_head = NULL;
+    #endif
     PUT(heap_listp, 0);                                /* Alignment padding */
     /* Prologue block은 Header + Footer (8 Bytes)로 구성된다. */
     PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, ALLOC)); /* Prologue header */
@@ -152,27 +171,31 @@ static void *extend_heap(size_t words)
  */
 void *mm_malloc(size_t size)
 {
-size_t asize;      /* Adjusted block size */
-    size_t extendsize; /* Amount to extend heap if no fit */
+    size_t asize;
+    size_t extendsize;
     char *bp;
 
     /* Ignore spurious requests */
     if (size == 0)
         return NULL;
 
-    /* Adjust block size to include overhead and alignment reqs. */
+    #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
     if (size <= DSIZE)
-        asize = 2 * DSIZE; // 최소 블록 크기 (header + footer + 최소 payload)
+        asize = 4 * DSIZE;
     else
         asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+    #else
+    if (size <= DSIZE)
+        asize = 2 * DSIZE;
+    else
+        asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+    #endif
 
-    /* Search the free list for a fit */
     if ((bp = find_fit(asize)) != NULL) {
         place(bp, asize);
         return bp;
     }
 
-    /* No fit found. Get more memory and place the block */
     extendsize = MAX(asize, CHUNKSIZE);
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL)
         return NULL;
@@ -203,13 +226,19 @@ static void *coalesce(void *bp){
     /* Case 1
     이전 블록, 다음 블록 모두 할당되어 있음
     */
-    if (prev_alloc && next_alloc) {            
+    if (prev_alloc && next_alloc) {
+        #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
+        insert_free(bp);
+        #endif          
         return bp;
     }
     /* Case 2 
     이전 블록은 할당, 다음 블록은 free
     */
     else if(prev_alloc && !next_alloc) {
+        #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
+        remove_free(NEXT_BLKP(bp));
+        #endif
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(bp), PACK(size, FREE));
         PUT(FTRP(bp), PACK(size, FREE));
@@ -217,7 +246,10 @@ static void *coalesce(void *bp){
     /* Case 3 
     이전 블록은 free, 다음 블록은 할당
     */
-    else if(!prev_alloc && next_alloc) {       
+    else if(!prev_alloc && next_alloc) {
+        #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
+        remove_free(PREV_BLKP(bp));
+        #endif
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
         PUT(FTRP(bp), PACK(size, FREE));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, FREE));
@@ -227,6 +259,10 @@ static void *coalesce(void *bp){
     이전 블록 free, 다음 블록 free
     */
     else {
+        #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
+        remove_free(PREV_BLKP(bp));
+        remove_free(NEXT_BLKP(bp));
+        #endif
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, FREE));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, FREE));
@@ -235,6 +271,10 @@ static void *coalesce(void *bp){
     
     // 탐색이 끝나는 pointer를 변수로 저장
     g_next_p = bp;
+    // explicit
+    #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
+    insert_free(bp);
+    #endif
     return bp;
 }
 
@@ -242,6 +282,8 @@ static void *find_fit(size_t asize)
 {
     // implicit first_fit, next_fit
     void *bp;
+    void *best_bp;      // 가장 좋은 블록 저장
+    size_t best_size = (size_t)-1;   // 가장 좋은 블록의 크기
     #if defined(USE_FIRST)
     for ( bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
         if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp))))
@@ -269,6 +311,37 @@ static void *find_fit(size_t asize)
             return bp;
         }
     }
+    #elif defined(USE_EXPLI)
+    for ( bp = free_list_head; bp != NULL; bp = SUCC(bp)){
+        if ((asize <= GET_SIZE(HDRP(bp))))
+        {
+            return bp;
+        }
+    }
+    #elif defined(USE_EXPLI_BEST)
+    best_bp = NULL;
+    for (bp = free_list_head; bp != NULL; bp = SUCC(bp)) {
+        // 여기서 무엇을 비교해야 할까?
+        // 언제 best_bp를 업데이트할까?
+        size_t curr_size = GET_SIZE(HDRP(bp));
+
+        // 1. asize보다 작으면 스킵
+        if (curr_size < asize) {
+              continue;
+        }
+
+        // 2. asize 이상이면서 이전 best보다 작은 경우
+        if (curr_size < best_size) {
+            best_bp = bp;
+            best_size = curr_size;
+
+            // 3. 완벽하게 맞으면 조기 종료
+            if (curr_size == asize) {
+                break;
+            }
+        }
+      }
+    return best_bp;
     #endif
     return NULL;
 }
@@ -277,16 +350,32 @@ static void *find_fit(size_t asize)
 static void place(void *bp, size_t asize)
 {
     size_t csize = GET_SIZE(HDRP(bp)); // 현재 블록의 크기를 알아냄
+    void *next_bp;
+
+    #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
+    remove_free(bp);
+    #endif
 
     // 남은 공간이 충분히 클 경우, 즉 요청한 크기(asize)와 현재 크기(csize)의 차이가
     // 두 배의 더블 사이즈(DSIZE)보다 크거나 같으면 블록을 나눔
+
+    // explicit에서는 Free Block 레이아웃에 PRED와 SUCC가 추가가 되어 최소 24bit의 공간을 필요로 함
+    #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
+    if ((csize - asize) >= (4 * DSIZE))
+    #else
     if ((csize - asize) >= (2 * DSIZE))
+    #endif
     {
         PUT(HDRP(bp), PACK(asize, 1));         // 사용할 블록의 헤더에 크기와 할당된 상태 저장
         PUT(FTRP(bp), PACK(asize, 1));         // 사용할 블록의 푸터에도 똑같이 저장
-        bp = NEXT_BLKP(bp);                    // 나머지 블록으로 포인터 이동
-        PUT(HDRP(bp), PACK(csize - asize, 0)); // 나머지 블록의 헤더에 크기와 빈 상태 저장
-        PUT(FTRP(bp), PACK(csize - asize, 0)); // 나머지 블록의 푸터에도 똑같이 저장
+        next_bp = NEXT_BLKP(bp);
+        // bp = NEXT_BLKP(bp);                    // 나머지 블록으로 포인터 이동
+        PUT(HDRP(next_bp), PACK(csize - asize, 0)); // 나머지 블록의 헤더에 크기와 빈 상태 저장
+        PUT(FTRP(next_bp), PACK(csize - asize, 0)); // 나머지 블록의 푸터에도 똑같이 저장
+
+        #if defined(USE_EXPLI) || defined(USE_EXPLI_BEST)
+        insert_free(next_bp);  // 남은 블록을 free list에 추가
+        #endif
     }
     else // 남은 공간이 충분히 크지 않으면 현재 블록 전체 사용
     {
@@ -313,4 +402,43 @@ void *mm_realloc(void *ptr, size_t size)
     memcpy(newptr, oldptr, copySize);
     mm_free(oldptr);
     return newptr;
+}
+
+// explicit
+static void insert_free(void *bp) 
+{
+    /* LIFO로 head에 붙이기 */  
+    if (free_list_head == NULL) {
+        SUCC(bp) = NULL;
+        PRED(bp) = NULL;
+        free_list_head = bp;
+    } else {
+        SUCC(bp) = free_list_head;
+        PRED(bp) = NULL;
+        PRED(free_list_head) = bp;
+        free_list_head = bp;
+    }
+}
+static void remove_free(void *bp) 
+{
+    void *prev = PRED(bp);
+    void *next = SUCC(bp);
+
+    if(prev == NULL && next == NULL){
+        // 리스트에 bp만 있는 경우
+        free_list_head = NULL;
+    }
+    else if(prev == NULL){
+        // bp가 head일 때
+        free_list_head = next;
+        if (next) PRED(next) = NULL;
+    }else if(next == NULL){
+        // bp가 tail일 때
+        SUCC(prev) = NULL;
+    }else{
+        // bp가 중간 노드일 때
+        SUCC(prev) = next;
+        PRED(next) = prev;
+    }
+     /* prev/next 포인터 정리 */ 
 }
